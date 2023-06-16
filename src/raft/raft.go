@@ -197,22 +197,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		PrettyDebug(dClient, fmt.Sprintf("Server %d appendEntries: term %v is less than current term %v", rf.me, args.Term, rf.currentTerm))
+		PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: term %v is less than current term %v", rf.me, args.Term, rf.currentTerm))
 		return
 	}
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		PrettyDebug(dClient, fmt.Sprintf("Server %d appendEntries: prevLogIndex %v or prevLogTerm %v does not match", rf.me, args.PrevLogIndex, args.PrevLogTerm))
+		PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: prevLogIndex %v or prevLogTerm %v does not match", rf.me, args.PrevLogIndex, args.PrevLogTerm))
 		return
 	}
 
 	for i, entry := range args.Entries {
 		if args.PrevLogIndex+i+1 >= len(rf.log) {
-			PrettyDebug(dClient, fmt.Sprintf("Server %d appendEntries: append entry, ind %d", rf.me, args.PrevLogIndex+i+1))
+			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: append entry, ind %d, log term %d", rf.me, args.PrevLogIndex+i+1, entry.Term))
 			rf.log = append(rf.log, entry)
 		} else {
-			PrettyDebug(dClient, fmt.Sprintf("Server %d appendEntries: replace entry %d", rf.me, args.PrevLogIndex+i+1))
+			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: replace entry %d, old log term %d new log term %d", rf.me, args.PrevLogIndex+i+1, rf.log[args.PrevLogIndex+i+1].Term, entry.Term))
 			rf.log[args.PrevLogIndex+i+1] = entry
 		}
 	}
@@ -224,7 +224,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		newCommitInd := min(args.LeaderCommit, len(rf.log)-1)
 		for i := rf.commitIndex + 1; i <= newCommitInd; i++ {
 			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
-			PrettyDebug(dCommit, fmt.Sprintf("Server %d appendEntries: commitIndex updated to %d", rf.me, i))
+			PrettyDebug(dCommit, fmt.Sprintf("S%d appendEntries: commitIndex updated to %d", rf.me, i))
 		}
 	}
 
@@ -277,7 +277,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.role = Follower
 			reply.VoteGranted = true
 			reply.Term = rf.currentTerm
-			PrettyDebug(dClient, fmt.Sprintf("Server %d voted for %d, local last term %d canidata last term %d", rf.me, args.CandidateId, rf.log[len(rf.log)-1].Term, args.LastLogTerm))
+			PrettyDebug(dClient, fmt.Sprintf("S%d voted for %d, local last term %d canidata last term %d", rf.me, args.CandidateId, rf.log[len(rf.log)-1].Term, args.LastLogTerm))
 			rf.persist()
 			return
 		}
@@ -359,7 +359,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = true
 	rf.log = append(rf.log, LogEntry{Term: term, Command: command})
 	rf.persist()
-	PrettyDebug(dLeader, fmt.Sprintf("Leader %d start command, log number %d", rf.me, index))
+	PrettyDebug(dLeader, fmt.Sprintf("L%d start command, log number %d", rf.me, index))
 	return index, term, isLeader
 }
 
@@ -382,9 +382,15 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// If there exists an N such that N > commitIndex, a majority
+// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+
+// set commitIndex = N (§5.3, §5.4).
 func (rf *Raft) leaderCommit() {
 	for j := rf.commitIndex + 1; j < len(rf.log); j++ {
-
+		if rf.log[j].Term != rf.currentTerm {
+			continue
+		}
 		count := 1
 		for k := 0; k < len(rf.peers); k++ {
 			if k != rf.me && rf.matchIndex[k] >= j {
@@ -392,11 +398,12 @@ func (rf *Raft) leaderCommit() {
 			}
 		}
 		if count > len(rf.peers)/2 {
+			for i := rf.commitIndex + 1; i <= j; i++ {
+				PrettyDebug(dLeader, fmt.Sprintf("L%d commit log %d", rf.me, i))
+				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+			}
 			rf.commitIndex = j
-			PrettyDebug(dLeader, fmt.Sprintf("leader %d commit log %d", rf.me, j))
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[rf.commitIndex].Command, CommandIndex: rf.commitIndex}
 		}
-
 	}
 }
 
@@ -438,14 +445,14 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 						rf.mu.Unlock()
 						return
 					} else {
-						PrettyDebug(dLeader, fmt.Sprintf("leader %d send log to %d failed, nextind %d replyTerm %d", rf.me, i, rf.nextIndex[i], reply.Term))
+						PrettyDebug(dLeader, fmt.Sprintf("L%d send log to %d failed, nextind %d replyTerm %d", rf.me, i, rf.nextIndex[i], reply.Term))
 						rf.mu.Lock()
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.convertToFollwer()
 
 							rf.mu.Unlock()
-							PrettyDebug(dLeader, fmt.Sprintf("leader %d become follower, curr term %d", rf.me, rf.currentTerm))
+							PrettyDebug(dLeader, fmt.Sprintf("L%d become follower, curr term %d", rf.me, rf.currentTerm))
 							return
 						}
 						rf.nextIndex[i] = rf.nextIndex[i] - 1
@@ -459,7 +466,7 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 
 func (rf *Raft) broadcastRequestVote() {
 	rf.mu.Lock()
-	PrettyDebug(dCandidate, fmt.Sprintf("Server %d broadcasting request vote, currTerm %d", rf.me, rf.currentTerm))
+	PrettyDebug(dCandidate, fmt.Sprintf("S%d broadcasting request vote, currTerm %d", rf.me, rf.currentTerm))
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -512,7 +519,7 @@ func (rf *Raft) broadcastRequestVote() {
 }
 
 func (rf *Raft) startLeader() {
-	PrettyDebug(dLeader, fmt.Sprintf("Server %d become leader currTerm %d", rf.me, rf.currentTerm))
+	PrettyDebug(dLeader, fmt.Sprintf("S%d become leader currTerm %d", rf.me, rf.currentTerm))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
@@ -547,9 +554,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			continue
 		}
-		rf.mu.Unlock()
 
-		rf.mu.Lock()
 		if rf.lastHeartbeat.Add(heartbeatTimeout).Before(time.Now()) {
 			rf.currentTerm++
 			rf.votedFor = rf.me
