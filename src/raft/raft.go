@@ -200,6 +200,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: term %v is less than current term %v", rf.me, args.Term, rf.currentTerm))
 		return
 	}
+
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -216,9 +217,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log[args.PrevLogIndex+i+1] = entry
 		}
 	}
+	if rf.currentTerm < args.Term {
+		rf.convertToFollwer()
+	}
+	rf.role = Follower
 	rf.currentTerm = args.Term
 	rf.leaderId = args.LeaderId
-	rf.convertToFollwer()
+
 	rf.persist()
 	if args.LeaderCommit > rf.commitIndex {
 		newCommitInd := min(args.LeaderCommit, len(rf.log)-1)
@@ -417,7 +422,7 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 						rf.mu.Unlock()
 						return
 					}
-					rf.leaderCommit()
+					// rf.leaderCommit()
 					args := &AppendEntriesArgs{
 						Term:         rf.currentTerm,
 						LeaderId:     rf.me,
@@ -439,8 +444,8 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 					// rf.mu.Unlock()
 					if reply.Success {
 						rf.mu.Lock()
-						rf.nextIndex[i] = len(rf.log)
-						rf.matchIndex[i] = len(rf.log) - 1
+						rf.nextIndex[i] = len(args.Entries) + args.PrevLogIndex + 1
+						rf.matchIndex[i] = len(args.Entries) + args.PrevLogIndex
 						rf.leaderCommit()
 						rf.mu.Unlock()
 						return
@@ -455,13 +460,20 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 							PrettyDebug(dLeader, fmt.Sprintf("L%d become follower, curr term %d", rf.me, rf.currentTerm))
 							return
 						}
-						rf.nextIndex[i] = rf.nextIndex[i] - 1
+						rf.nextIndex[i] = max(rf.nextIndex[i]-1, 1)
 						rf.mu.Unlock()
 					}
 				}
 			}(i)
 		}
 	}
+}
+
+func max(i1, i2 int) int {
+	if i1 > i2 {
+		return i1
+	}
+	return i2
 }
 
 func (rf *Raft) broadcastRequestVote() {
