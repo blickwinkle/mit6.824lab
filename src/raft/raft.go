@@ -180,6 +180,14 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+
+	// Fast Revocer
+	// XTerm：这个是Follower中与Leader冲突的Log对应的任期号。在之前（7.1）有介绍Leader会在prevLogTerm中带上本地Log记录中，前一条Log的任期号。如果Follower在对应位置的任期号不匹配，它会拒绝Leader的AppendEntries消息，并将自己的任期号放在XTerm中。如果Follower在对应位置没有Log，那么这里会返回 -1。
+	// XIndex：这个是Follower中，对应任期号为XTerm的第一条Log条目的槽位号。
+	// XLen：如果Follower在对应位置没有Log，那么XTerm会返回-1，XLen表示空白的Log槽位数。
+	XTerm int // term of conflicting entry
+	XIdx  int // first index of the conflicting term's log entry idx
+	XLen  int // if Xtrem == -1, XLen is the length of the follower's blank log
 }
 
 func (rf *Raft) convertToFollwer() {
@@ -205,6 +213,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: prevLogIndex %v or prevLogTerm %v does not match", rf.me, args.PrevLogIndex, args.PrevLogTerm))
+		if len(rf.log) <= args.PrevLogIndex {
+			reply.XTerm = -1
+			reply.XIdx = -1
+			reply.XLen = args.PrevLogIndex - len(rf.log) + 1
+		} else {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			reply.XIdx = 0
+			for i := args.PrevLogIndex - 1; i >= 0; i-- {
+				if rf.log[i].Term != reply.XTerm {
+					reply.XIdx = i + 1
+					break
+				}
+			}
+			reply.XLen = -1
+		}
 		return
 	}
 
@@ -213,6 +236,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: append entry, ind %d, log term %d", rf.me, args.PrevLogIndex+i+1, entry.Term))
 			rf.log = append(rf.log, entry)
 		} else {
+			if rf.log[args.PrevLogIndex+i+1].Term != entry.Term {
+				rf.log = rf.log[:args.PrevLogIndex+i+1]
+				PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: append entry, ind %d, log term %d", rf.me, args.PrevLogIndex+i+1, entry.Term))
+				rf.log = append(rf.log, entry)
+				continue
+			}
 			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: replace entry %d, old log term %d new log term %d", rf.me, args.PrevLogIndex+i+1, rf.log[args.PrevLogIndex+i+1].Term, entry.Term))
 			rf.log[args.PrevLogIndex+i+1] = entry
 		}
@@ -228,9 +257,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		newCommitInd := min(args.LeaderCommit, len(rf.log)-1)
 		for i := rf.commitIndex + 1; i <= newCommitInd; i++ {
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
 			PrettyDebug(dCommit, fmt.Sprintf("S%d appendEntries: commitIndex updated to %d", rf.me, i))
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
 		}
+		rf.commitIndex = newCommitInd
 	}
 
 	reply.Term = rf.currentTerm
@@ -460,7 +490,19 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 							PrettyDebug(dLeader, fmt.Sprintf("L%d become follower, curr term %d", rf.me, rf.currentTerm))
 							return
 						}
-						rf.nextIndex[i] = max(rf.nextIndex[i]-1, 1)
+						// rf.nextIndex[i] = max(rf.nextIndex[i]-1, 1)
+						if reply.XTerm != -1 {
+							rf.nextIndex[i] = reply.XIdx
+							for j := args.PrevLogIndex; j >= 0; j-- {
+								if rf.log[j].Term == reply.XTerm {
+									rf.nextIndex[i] = j + 1
+									break
+								}
+							}
+						} else {
+							rf.nextIndex[i] = reply.XLen
+						}
+
 						rf.mu.Unlock()
 					}
 				}
