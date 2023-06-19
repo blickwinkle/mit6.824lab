@@ -38,11 +38,11 @@ const (
 	Leader    = 2
 )
 
-const heartbeatTimeout = time.Duration(300) * time.Millisecond
+const heartbeatTimeout = time.Duration(150) * time.Millisecond
 
-const electionTimeout = time.Duration(800) * time.Millisecond
+const electionTimeout = time.Duration(300) * time.Millisecond
 
-const heartbeatInterval = time.Duration(50) * time.Millisecond
+const heartbeatInterval = time.Duration(40) * time.Millisecond
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -602,7 +602,7 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		time.Sleep(time.Duration(rand.Intn(20)+30) * time.Millisecond)
+		time.Sleep(time.Duration(rand.Intn(10)+20) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.role == Leader {
 			rf.mu.Unlock()
