@@ -70,6 +70,104 @@ type LogEntry struct {
 	Command interface{}
 }
 
+type Log struct {
+	Entries             []LogEntry
+	LastSnapShotLogIdx  int
+	LastSnapShotLogTerm int
+	LastSnapshot        []byte
+}
+
+func (l *Log) init() {
+	l.Entries = make([]LogEntry, 0)
+	l.LastSnapShotLogIdx = -1
+	l.LastSnapShotLogTerm = -1
+}
+
+func (l *Log) updateSnapShot(idx int, term int, snapshot []byte) {
+	l.deleteLogEntriesTo(idx)
+
+	l.LastSnapShotLogIdx = idx
+	l.LastSnapShotLogTerm = term
+	l.LastSnapshot = snapshot
+}
+
+func (l *Log) getLogEntry(idx int) LogEntry {
+	return l.Entries[idx-l.LastSnapShotLogIdx-1]
+}
+
+func (l *Log) getLogEntries(startIdx int) []LogEntry {
+	return l.Entries[startIdx-l.LastSnapShotLogIdx-1:]
+}
+
+func (l *Log) getLogEntriesFrom(startIdx int) []LogEntry {
+	return l.Entries[startIdx-l.LastSnapShotLogIdx-1:]
+}
+
+func (l *Log) getLogEntriesTo(endIdx int) []LogEntry {
+	return l.Entries[:endIdx-l.LastSnapShotLogIdx-1]
+}
+
+func (l *Log) getLogEntriesFromTo(startIdx int, endIdx int) []LogEntry {
+	return l.Entries[startIdx-l.LastSnapShotLogIdx-1 : endIdx-l.LastSnapShotLogIdx-1]
+}
+
+func (l *Log) updateLogEntries(startIdx int, entries []LogEntry) {
+	l.Entries = append(l.getLogEntriesTo(startIdx), entries...)
+}
+
+func (l *Log) updateLogEntriesFrom(startIdx int, entries []LogEntry) {
+	l.Entries = append(l.getLogEntriesFrom(startIdx), entries...)
+}
+
+func (l *Log) updateLogEntriesTo(endIdx int, entries []LogEntry) {
+	l.Entries = append(entries, l.getLogEntriesFrom(endIdx)...)
+}
+
+func (l *Log) updateLogEntriesFromTo(startIdx int, endIdx int, entries []LogEntry) {
+	l.Entries = append(l.getLogEntriesFrom(startIdx), entries...)
+	l.Entries = append(l.Entries, l.getLogEntriesFrom(endIdx)...)
+}
+
+func (l *Log) deleteLogEntriesTo(endIdx int) {
+	l.Entries = l.getLogEntriesTo(endIdx)
+}
+
+func (l *Log) deleteLogEntriesFromTo(startIdx int, endIdx int) {
+	l.Entries = append(l.getLogEntriesTo(startIdx), l.getLogEntriesFrom(endIdx)...)
+}
+
+func (l *Log) deleteLogEntries(startIdx int, entries []LogEntry) {
+	l.Entries = append(l.getLogEntriesTo(startIdx), l.getLogEntriesFrom(startIdx+len(entries))...)
+}
+
+func (l *Log) deleteLogEntriesFrom(startIdx int, entries []LogEntry) {
+	l.Entries = append(l.getLogEntriesTo(startIdx), l.getLogEntriesFrom(startIdx+len(entries))...)
+}
+
+func (l *Log) replaceOneLogEntry(idx int, entry LogEntry) {
+	l.Entries[idx-l.LastSnapShotLogIdx-1] = entry
+}
+
+func (l *Log) getLogLength() int {
+	return len(l.Entries)
+}
+
+func (l *Log) getLastLogEntry() LogEntry {
+	return l.Entries[len(l.Entries)-1]
+}
+
+func (l *Log) getLastFesibleLogEntryIdx() int {
+	return l.LastSnapShotLogIdx + len(l.Entries)
+}
+
+func (l *Log) getOriginLen() int {
+	return len(l.Entries) + l.LastSnapShotLogIdx + 1
+}
+
+func (l *Log) appendBack(entry LogEntry) {
+	l.Entries = append(l.Entries, entry)
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -83,9 +181,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 	applyCh chan ApplyMsg
 	// Persistent state on all servers
-	currentTerm int        // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor    int        // candidateId that received vote in current term (or null if none)
-	log         []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	currentTerm int  // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int  // candidateId that received vote in current term (or null if none)
+	log         *Log // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 
 	// Volatile state on all servers
 	commitIndex   int // index of highest log entry known to be committed
@@ -93,7 +191,6 @@ type Raft struct {
 	leaderId      int // leaderId of the leader
 	role          int // role of the server
 	lastHeartbeat time.Time
-
 	// Volatile state on leaders
 	nextIndex  []int // initialized to leader last log index + 1, for each server, index of the next log entry to send to that server
 	matchIndex []int // initialized to 0, for each server, index of highest log entry known to be replicated on server
@@ -123,7 +220,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	// rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.log.LastSnapshot)
 }
 
 // restore previously persisted state.
@@ -137,7 +235,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currTerm int
 	var votedFor int
-	var log []LogEntry
+	var log Log
 	if d.Decode(&currTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil {
@@ -146,7 +244,7 @@ func (rf *Raft) readPersist(data []byte) {
 	} else {
 		rf.currentTerm = currTerm
 		rf.votedFor = votedFor
-		rf.log = log
+		rf.log = &log
 	}
 }
 
@@ -165,7 +263,20 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.snapShotInternal(index, snapshot)
+}
 
+func (rf *Raft) snapShotInternal(index int, snapshot []byte) {
+	if index <= rf.log.LastSnapShotLogIdx || index > rf.log.getLastFesibleLogEntryIdx() {
+		PrettyDebug(dSnap, fmt.Sprintf("S%d Snapshot %d failed", rf.me, index))
+		return
+	}
+
+	rf.log.updateSnapShot(index, rf.log.getLogEntry(index).Term, snapshot)
+	rf.persist()
+	PrettyDebug(dSnap, fmt.Sprintf("S%d Snapshot %d success", rf.me, index))
 }
 
 type AppendEntriesArgs struct {
@@ -209,19 +320,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log.getLastFesibleLogEntryIdx() < args.PrevLogIndex || rf.log.getLogEntry(args.PrevLogIndex).Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: prevLogIndex %v or prevLogTerm %v does not match", rf.me, args.PrevLogIndex, args.PrevLogTerm))
-		if len(rf.log) <= args.PrevLogIndex {
+		if rf.log.getLastFesibleLogEntryIdx() < args.PrevLogIndex {
 			reply.XTerm = -1
 			reply.XIdx = -1
-			reply.XLen = args.PrevLogIndex - len(rf.log) + 1
+			reply.XLen = args.PrevLogIndex - rf.log.getLastFesibleLogEntryIdx()
 		} else {
-			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			reply.XTerm = rf.log.getLogEntry(args.PrevLogIndex).Term
 			reply.XIdx = 0
 			for i := args.PrevLogIndex - 1; i >= 0; i-- {
-				if rf.log[i].Term != reply.XTerm {
+				if rf.log.getLogEntry(i).Term != reply.XTerm {
 					reply.XIdx = i + 1
 					break
 				}
@@ -232,18 +343,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	for i, entry := range args.Entries {
-		if args.PrevLogIndex+i+1 >= len(rf.log) {
+		if args.PrevLogIndex+i+1 >= rf.log.getOriginLen() {
 			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: append entry, ind %d, log term %d", rf.me, args.PrevLogIndex+i+1, entry.Term))
-			rf.log = append(rf.log, entry)
+			rf.log.appendBack(entry)
 		} else {
-			if rf.log[args.PrevLogIndex+i+1].Term != entry.Term {
-				rf.log = rf.log[:args.PrevLogIndex+i+1]
+			if rf.log.getLogEntry(args.PrevLogIndex+i+1).Term != entry.Term {
+				rf.log.deleteLogEntriesTo(args.PrevLogIndex + i + 1)
 				PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: append entry, ind %d, log term %d", rf.me, args.PrevLogIndex+i+1, entry.Term))
-				rf.log = append(rf.log, entry)
+				rf.log.appendBack(entry)
 				continue
 			}
-			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: replace entry %d, old log term %d new log term %d", rf.me, args.PrevLogIndex+i+1, rf.log[args.PrevLogIndex+i+1].Term, entry.Term))
-			rf.log[args.PrevLogIndex+i+1] = entry
+			PrettyDebug(dClient, fmt.Sprintf("S%d appendEntries: replace entry %d, old log term %d new log term %d", rf.me, args.PrevLogIndex+i+1, rf.log.getLogEntry(args.PrevLogIndex+i+1).Term, entry.Term))
+			// rf.log[args.PrevLogIndex+i+1] = entry
+			rf.log.replaceOneLogEntry(args.PrevLogIndex+i+1, entry)
 		}
 	}
 	if rf.currentTerm < args.Term {
@@ -255,11 +367,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.persist()
 	if args.LeaderCommit > rf.commitIndex {
-		newCommitInd := min(args.LeaderCommit, len(rf.log)-1)
+		newCommitInd := min(args.LeaderCommit, rf.log.getOriginLen()-1)
 		for i := rf.commitIndex + 1; i <= newCommitInd; i++ {
 			PrettyDebug(dCommit, fmt.Sprintf("S%d appendEntries: commitIndex updated to %d", rf.me, i))
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+			rf.applyCh <- ApplyMsg{CommandValid: true,
+				Command:       rf.log.getLogEntry(i).Command,
+				CommandIndex:  i,
+				SnapshotValid: true,
+				Snapshot:      rf.log.LastSnapshot,
+				SnapshotTerm:  rf.log.LastSnapShotLogTerm,
+				SnapshotIndex: rf.log.LastSnapShotLogIdx,
+			}
 		}
+		// Test SnapShot
+		// rf.snapShotInternal(newCommitInd, nil)
+
 		rf.commitIndex = newCommitInd
 	}
 
@@ -307,12 +429,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.convertToFollwer()
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		if args.LastLogTerm > rf.log[len(rf.log)-1].Term || (args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1) {
+		if args.LastLogTerm > rf.log.getLastLogEntry().Term || (args.LastLogTerm == rf.log.getLastLogEntry().Term && args.LastLogIndex >= rf.log.getLastFesibleLogEntryIdx()) {
 			rf.votedFor = args.CandidateId
 			rf.role = Follower
 			reply.VoteGranted = true
 			reply.Term = rf.currentTerm
-			PrettyDebug(dClient, fmt.Sprintf("S%d voted for %d, local last term %d canidata last term %d", rf.me, args.CandidateId, rf.log[len(rf.log)-1].Term, args.LastLogTerm))
+			PrettyDebug(dClient, fmt.Sprintf("S%d voted for %d, local last term %d canidata last term %d", rf.me, args.CandidateId, rf.log.getLastLogEntry().Term, args.LastLogTerm))
 			rf.persist()
 			return
 		}
@@ -389,10 +511,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != Leader {
 		return index, term, false
 	}
-	index = len(rf.log)
+	index = rf.log.getOriginLen()
 	term = rf.currentTerm
 	isLeader = true
-	rf.log = append(rf.log, LogEntry{Term: term, Command: command})
+	rf.log.appendBack(LogEntry{Term: term, Command: command})
 	rf.persist()
 	PrettyDebug(dLeader, fmt.Sprintf("L%d start command, log number %d", rf.me, index))
 	return index, term, isLeader
@@ -422,8 +544,8 @@ func (rf *Raft) killed() bool {
 
 // set commitIndex = N (§5.3, §5.4).
 func (rf *Raft) leaderCommit() {
-	for j := rf.commitIndex + 1; j < len(rf.log); j++ {
-		if rf.log[j].Term != rf.currentTerm {
+	for j := rf.commitIndex + 1; j < rf.log.getOriginLen(); j++ {
+		if rf.log.getLogEntry(j).Term != rf.currentTerm {
 			continue
 		}
 		count := 1
@@ -435,7 +557,11 @@ func (rf *Raft) leaderCommit() {
 		if count > len(rf.peers)/2 {
 			for i := rf.commitIndex + 1; i <= j; i++ {
 				PrettyDebug(dLeader, fmt.Sprintf("L%d commit log %d", rf.me, i))
-				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log.getLogEntry(i).Command, CommandIndex: i,
+					SnapshotValid: true,
+					Snapshot:      rf.log.LastSnapshot,
+					SnapshotTerm:  rf.log.LastSnapShotLogTerm,
+					SnapshotIndex: rf.log.LastSnapShotLogIdx}
 			}
 			rf.commitIndex = j
 		}
@@ -457,8 +583,9 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 						Term:         rf.currentTerm,
 						LeaderId:     rf.me,
 						PrevLogIndex: rf.nextIndex[i] - 1,
-						PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-						Entries:      rf.log[rf.nextIndex[i]:],
+						PrevLogTerm:  rf.log.getLogEntry(rf.nextIndex[i] - 1).Term,
+						//	Entries:      rf.log[rf.nextIndex[i]:],
+						Entries:      rf.log.getLogEntriesFrom(rf.nextIndex[i]),
 						LeaderCommit: rf.commitIndex,
 					}
 					rf.mu.Unlock()
@@ -494,7 +621,7 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 						if reply.XTerm != -1 {
 							rf.nextIndex[i] = reply.XIdx
 							for j := args.PrevLogIndex; j >= 0; j-- {
-								if rf.log[j].Term == reply.XTerm {
+								if rf.log.getLogEntry(j).Term == reply.XTerm {
 									rf.nextIndex[i] = j + 1
 									break
 								}
@@ -524,8 +651,8 @@ func (rf *Raft) broadcastRequestVote() {
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		LastLogIndex: rf.log.getLastFesibleLogEntryIdx(),
+		LastLogTerm:  rf.log.getLastLogEntry().Term,
 	}
 	rf.mu.Unlock()
 
@@ -577,7 +704,7 @@ func (rf *Raft) startLeader() {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.log.getOriginLen()
 		rf.matchIndex[i] = 0
 	}
 
@@ -643,8 +770,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.votedFor = -1
 	rf.currentTerm = 0
-	rf.log = make([]LogEntry, 1)
-	rf.log[0] = LogEntry{Term: 0, Command: nil}
+	rf.log = &Log{}
+	rf.log.init()
+	rf.log.appendBack(LogEntry{Term: 0})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
