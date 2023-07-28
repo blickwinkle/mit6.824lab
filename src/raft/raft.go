@@ -23,13 +23,13 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
+	"github.com/sasha-s/go-deadlock"
 )
 
 const (
@@ -43,11 +43,11 @@ var (
 	ErrOutRange = fmt.Errorf("out of range")
 )
 
-const heartbeatTimeout = time.Duration(100) * time.Millisecond
+const heartbeatTimeout = time.Duration(50) * time.Millisecond
 
-const electionTimeout = time.Duration(200) * time.Millisecond
+const electionTimeout = time.Duration(100) * time.Millisecond
 
-const heartbeatInterval = time.Duration(30) * time.Millisecond
+const heartbeatInterval = time.Duration(15) * time.Millisecond
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -94,6 +94,14 @@ func (l *Log) updateSnapShot(idx int, term int, snapshot []byte) {
 	l.LastSnapShotLogIdx = idx
 	l.LastSnapShotLogTerm = term
 	l.LastSnapshot = snapshot
+
+}
+
+func (l *Log) getLastestTerm() int {
+	if len(l.Entries) == 0 {
+		return l.LastSnapShotLogTerm
+	}
+	return l.Entries[len(l.Entries)-1].Term
 }
 
 func (l *Log) Term(idx int) (int, error) {
@@ -200,7 +208,7 @@ func (l *Log) appendBack(entry LogEntry) {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -271,14 +279,18 @@ func (rf *Raft) readPersist(data []byte) {
 	var log Log
 	if d.Decode(&currTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil ||
-		d.Decode(&log.LastSnapshot) != nil {
+		d.Decode(&log) != nil {
 		// fmt.Printf("Error in readPersist")
 		panic("Error in readPersist")
 	} else {
+		rf.log = &log
+		rf.log.LastSnapshot = rf.persister.ReadSnapshot()
+		if rf.log.LastSnapshot == nil && rf.log.LastSnapShotLogIdx != -1 {
+			panic("Error in readPersist snapshot is nil but LastSnapShotLogIdx is not -1")
+		}
 		rf.currentTerm = currTerm
 		rf.votedFor = votedFor
-		rf.log = &log
+
 	}
 }
 
@@ -330,7 +342,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  rf.log.LastSnapShotLogTerm,
 		SnapshotIndex: rf.log.LastSnapShotLogIdx,
 	}
-	PrettyDebug(dSnap, "S%d InstallSnapshot success. LastSanpeShot %d LastSnapTerm %d", rf.me, rf.log.LastSnapShotLogIdx, rf.log.LastSnapShotLogTerm)
+	PrettyDebug(dSnap, "S%d InstallSnapshot success. LastSanpeShot %d LastSnapTerm %d SnapShot len %d", rf.me, rf.log.LastSnapShotLogIdx, rf.log.LastSnapShotLogTerm, len(rf.log.LastSnapshot))
 
 }
 
@@ -363,7 +375,7 @@ func (rf *Raft) snapShotInternal(index int, snapshot []byte) {
 
 	rf.log.updateSnapShot(index, rf.log.getLogEntry(index).Term, snapshot)
 	rf.persist()
-	PrettyDebug(dSnap, fmt.Sprintf("S%d Snapshot %d success", rf.me, index))
+	PrettyDebug(dSnap, fmt.Sprintf("S%d Snapshot %d success snapshot len %d", rf.me, index, len(snapshot)))
 }
 
 type AppendEntriesArgs struct {
@@ -416,15 +428,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XIdx = -1
 			reply.XLen = args.PrevLogIndex - rf.log.getLastFesibleLogEntryIdx()
 		} else {
-			if err != nil {
-				panic(err)
-			}
+			// if err != nil {
+			// 	panic(err)
+			// }
 			reply.XTerm = term
 			reply.XIdx = 0
 			for i := args.PrevLogIndex - 1; i >= 0; i-- {
 				term, err := rf.log.Term(i)
 				if err != nil {
-					reply.XIdx = i + 1
+					reply.XIdx = rf.log.LastSnapShotLogIdx + 1
 					break
 				}
 				if term != reply.XTerm {
@@ -464,15 +476,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		newCommitInd := min(args.LeaderCommit, rf.log.getOriginLen()-1)
 		for i := rf.commitIndex + 1; i <= newCommitInd; i++ {
+			if i <= rf.log.LastSnapShotLogIdx {
+				PrettyDebug(dCommit, fmt.Sprintf("S%d commit snapshot lastTerm %d lastIdx %d snapshot len %d", rf.me, rf.log.LastSnapShotLogTerm, rf.log.LastSnapShotLogIdx, len(rf.log.LastSnapshot)))
+				rf.applyCh <- ApplyMsg{CommandValid: false,
+
+					SnapshotValid: true,
+					Snapshot:      rf.log.LastSnapshot,
+					SnapshotTerm:  rf.log.LastSnapShotLogTerm,
+					SnapshotIndex: rf.log.LastSnapShotLogIdx,
+				}
+				i = rf.log.LastSnapShotLogIdx
+				continue
+			}
+
 			PrettyDebug(dCommit, fmt.Sprintf("S%d appendEntries: commitIndex updated to %d", rf.me, i))
 			isSnapShot := false
 			rf.applyCh <- ApplyMsg{CommandValid: true,
 				Command:       rf.log.getLogEntry(i).Command,
 				CommandIndex:  i,
 				SnapshotValid: isSnapShot,
-				Snapshot:      rf.log.LastSnapshot,
-				SnapshotTerm:  rf.log.LastSnapShotLogTerm,
-				SnapshotIndex: rf.log.LastSnapShotLogIdx,
 			}
 		}
 		// Test SnapShot
@@ -525,10 +547,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.convertToFollwer()
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		term, err := rf.log.Term(rf.log.getLastFesibleLogEntryIdx())
-		if err != nil {
-			panic(err)
-		}
+		term := rf.log.getLastestTerm()
+
 		if args.LastLogTerm > term || (args.LastLogTerm == term && args.LastLogIndex >= rf.log.getLastFesibleLogEntryIdx()) {
 			rf.votedFor = args.CandidateId
 			rf.role = Follower
@@ -645,6 +665,9 @@ func (rf *Raft) killed() bool {
 // set commitIndex = N (§5.3, §5.4).
 func (rf *Raft) leaderCommit() {
 	for j := rf.commitIndex + 1; j < rf.log.getOriginLen(); j++ {
+		if j <= rf.log.LastSnapShotLogIdx {
+			continue
+		}
 		if rf.log.getLogEntry(j).Term != rf.currentTerm {
 			continue
 		}
@@ -656,13 +679,28 @@ func (rf *Raft) leaderCommit() {
 		}
 		if count > len(rf.peers)/2 {
 			for i := rf.commitIndex + 1; i <= j; i++ {
+				if i < rf.log.LastSnapShotLogIdx {
+					continue
+				}
+				if i == rf.log.LastSnapShotLogIdx {
+					PrettyDebug(dLeader, fmt.Sprintf("L%d commit snapshot lastTerm %d lastIdx %d snapshot len %d", rf.me, rf.log.LastSnapShotLogTerm, rf.log.LastSnapShotLogIdx, len(rf.log.LastSnapshot)))
+					rf.applyCh <- ApplyMsg{
+						CommandValid:  false,
+						SnapshotValid: true,
+						Snapshot:      rf.log.LastSnapshot,
+						SnapshotTerm:  rf.log.LastSnapShotLogTerm,
+						SnapshotIndex: rf.log.LastSnapShotLogIdx,
+					}
+					continue
+				}
 				PrettyDebug(dLeader, fmt.Sprintf("L%d commit log %d", rf.me, i))
 				isSnapShot := false
-				rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log.getLogEntry(i).Command, CommandIndex: i,
+				rf.applyCh <- ApplyMsg{
+					CommandValid:  true,
+					Command:       rf.log.getLogEntry(i).Command,
+					CommandIndex:  i,
 					SnapshotValid: isSnapShot,
-					Snapshot:      rf.log.LastSnapshot,
-					SnapshotTerm:  rf.log.LastSnapShotLogTerm,
-					SnapshotIndex: rf.log.LastSnapShotLogIdx}
+				}
 			}
 			rf.commitIndex = j
 		}
@@ -681,7 +719,10 @@ func (rf *Raft) handleSendSnap(server int) bool {
 
 	reply := &InstallSnapshotReply{}
 	isSend := false
-	if isSend = rf.sendInstallSnapshot(server, args, reply); isSend {
+	rf.mu.Unlock()
+	isSend = rf.sendInstallSnapshot(server, args, reply)
+	rf.mu.Lock()
+	if isSend {
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.convertToFollwer()
@@ -759,14 +800,8 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 							for j := args.PrevLogIndex; j >= 0; j-- {
 								term, err := rf.log.Term(j)
 								if err != nil {
-									if !rf.handleSendSnap(i) || rf.role != Leader {
-										rf.mu.Unlock()
-										return
-									}
-									term, err = rf.log.Term(j)
-									if err != nil {
-										panic("Error in broadcastHeartbeatOrLog")
-									}
+									rf.nextIndex[i] = 0
+									break
 								}
 								if term == reply.XTerm {
 									rf.nextIndex[i] = j + 1
@@ -795,10 +830,7 @@ func max(i1, i2 int) int {
 func (rf *Raft) broadcastRequestVote() {
 	rf.mu.Lock()
 	PrettyDebug(dCandidate, fmt.Sprintf("S%d broadcasting request vote, currTerm %d", rf.me, rf.currentTerm))
-	term, err := rf.log.Term(rf.log.getLastFesibleLogEntryIdx())
-	if err != nil {
-		panic(err)
-	}
+	term := rf.log.getLastestTerm()
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
