@@ -43,11 +43,11 @@ var (
 	ErrOutRange = fmt.Errorf("out of range")
 )
 
-const heartbeatTimeout = time.Duration(50) * time.Millisecond
+const heartbeatTimeout = time.Duration(60) * time.Millisecond
 
 const electionTimeout = time.Duration(100) * time.Millisecond
 
-const heartbeatInterval = time.Duration(15) * time.Millisecond
+const heartbeatInterval = time.Duration(25) * time.Millisecond
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -241,6 +241,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
 	term = rf.currentTerm
 	isleader = (rf.role == Leader)
 	return term, isleader
@@ -326,9 +328,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastHeartbeat = time.Now()
 	rf.role = Follower
 	rf.leaderId = args.LeaderId
+	if args.LastIncludedIndex > rf.log.LastSnapShotLogIdx {
+		localTerm, err := rf.log.Term(args.LastIncludedIndex)
+		rf.log.updateSnapShot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+		if !(err == nil && localTerm == args.LastIncludedTerm) {
+			rf.log.Entries = make([]LogEntry, 0)
+		}
+	}
 
-	rf.log.updateSnapShot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
-	rf.log.Entries = make([]LogEntry, 0)
 	// rf.log.init()
 	// rf.log.appendBack(LogEntry{Term: 0})
 
