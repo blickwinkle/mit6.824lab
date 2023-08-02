@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync/atomic"
 	"time"
@@ -11,7 +12,7 @@ import (
 	"github.com/sasha-s/go-deadlock"
 )
 
-const Debug = true
+const Debug = false
 
 const d = 300 * time.Millisecond
 
@@ -60,8 +61,9 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	lastClientOP map[int64]*OpRes
-	storage      map[string]string
+	persister    *raft.Persister
+	LastClientOP map[int64]*OpRes
+	Storage      map[string]string
 	waitChannel  map[int64]chan<- *CommitInfo
 	commitIdx    int
 }
@@ -74,7 +76,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Lock()
-	if res, ok := kv.lastClientOP[args.ClientID]; ok && res.OpID == args.OpID {
+	if res, ok := kv.LastClientOP[args.ClientID]; ok && res.OpID == args.OpID {
 		reply.Err = res.Err
 		reply.Value = res.Value
 		kv.mu.Unlock()
@@ -112,14 +114,14 @@ OUTER_LOOP:
 	kv.waitChannel[args.ClientID] = nil
 	_, isLeader = kv.rf.GetState()
 	if waitInfo != nil && waitInfo.op != nil && waitInfo.op.OpID == args.OpID && isLeader {
-		if kv.storage[args.Key] == "" {
+		if kv.Storage[args.Key] == "" {
 			reply.Err = ErrNoKey
 			reply.Value = ""
 		} else {
 			reply.Err = OK
-			reply.Value = kv.storage[args.Key]
+			reply.Value = kv.Storage[args.Key]
 		}
-		// kv.lastClientOP[args.ClientID] = &OpRes{Err: reply.Err, Value: reply.Value, OpID: args.OpID}
+		// kv.LastClientOP[args.ClientID] = &OpRes{Err: reply.Err, Value: reply.Value, OpID: args.OpID}
 	} else {
 		reply.Err = ErrWrongLeader
 	}
@@ -135,7 +137,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Lock()
-	if res, ok := kv.lastClientOP[args.ClientID]; ok && res.OpID == args.OpID {
+	if res, ok := kv.LastClientOP[args.ClientID]; ok && res.OpID == args.OpID {
 		reply.Err = res.Err
 		kv.mu.Unlock()
 		return
@@ -194,13 +196,20 @@ func (kv *KVServer) handleMsg(ch <-chan *raft.ApplyMsg) {
 				kv.waitChannel[op.ClientID] = nil
 				close(waitChannel)
 			}
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				kv.rf.Snapshot(msg.CommandIndex, kv.store())
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			kv.restore(msg.Snapshot)
 			kv.mu.Unlock()
 		}
 	}
 }
 
 func (kv *KVServer) loop() {
-	msgCh := make(chan *raft.ApplyMsg, 100)
+	msgCh := make(chan *raft.ApplyMsg, 1000)
 	go kv.handleMsg(msgCh)
 	for {
 		select {
@@ -210,6 +219,7 @@ func (kv *KVServer) loop() {
 			// }
 			kv.commitIdx = msg.CommandIndex
 			msgCh <- &msg
+
 			// DPrintf("S%d msgCh len %v", kv.me, len(msgCh))
 		case <-time.After(3 * d):
 			if kv.killed() {
@@ -237,27 +247,27 @@ func (kv *KVServer) loop() {
 }
 
 func (kv *KVServer) applyOP(op *Op) {
-	if res, ok := kv.lastClientOP[op.ClientID]; ok && res.OpID == op.OpID {
+	if res, ok := kv.LastClientOP[op.ClientID]; ok && res.OpID == op.OpID {
 		return
 	}
 
 	switch op.OpType {
 	case GET:
 		DPrintf("S%d apply get key %v", kv.me, op.Key)
-		if kv.storage[op.Key] == "" {
-			kv.lastClientOP[op.ClientID] = &OpRes{Err: ErrNoKey, OpID: op.OpID}
+		if kv.Storage[op.Key] == "" {
+			kv.LastClientOP[op.ClientID] = &OpRes{Err: ErrNoKey, OpID: op.OpID}
 		} else {
-			kv.lastClientOP[op.ClientID] = &OpRes{Err: OK, Value: kv.storage[op.Key], OpID: op.OpID}
+			kv.LastClientOP[op.ClientID] = &OpRes{Err: OK, Value: kv.Storage[op.Key], OpID: op.OpID}
 		}
 	case PUT:
 		DPrintf("S%d apply put key %v value %v", kv.me, op.Key, op.Value)
-		kv.storage[op.Key] = op.Value
-		kv.lastClientOP[op.ClientID] = &OpRes{Err: OK, OpID: op.OpID}
+		kv.Storage[op.Key] = op.Value
+		kv.LastClientOP[op.ClientID] = &OpRes{Err: OK, OpID: op.OpID}
 
 	case APPEND:
 		DPrintf("S%d apply append key %v value %v", kv.me, op.Key, op.Value)
-		kv.storage[op.Key] += op.Value
-		kv.lastClientOP[op.ClientID] = &OpRes{Err: OK, OpID: op.OpID}
+		kv.Storage[op.Key] += op.Value
+		kv.LastClientOP[op.ClientID] = &OpRes{Err: OK, OpID: op.OpID}
 
 	}
 
@@ -280,6 +290,33 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) restore(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastClientOP map[int64]*OpRes
+	var storage map[string]string
+	if d.Decode(&lastClientOP) != nil ||
+		d.Decode(&storage) != nil {
+		panic("kvserver err in read snap")
+	}
+	kv.LastClientOP = lastClientOP
+	kv.Storage = storage
+
+}
+
+func (kv *KVServer) store() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.LastClientOP)
+	e.Encode(kv.Storage)
+	return w.Bytes()
 }
 
 // servers[] contains the ports of the set of
@@ -308,10 +345,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.waitChannel = make(map[int64]chan<- *CommitInfo)
-	kv.lastClientOP = make(map[int64]*OpRes)
-	kv.storage = make(map[string]string)
+	kv.LastClientOP = make(map[int64]*OpRes)
+	kv.Storage = make(map[string]string)
 	kv.commitIdx = -1
+	kv.persister = persister
 	// You may need initialization code here.
+	kv.restore(persister.ReadSnapshot())
 	go kv.loop()
 	return kv
 }
