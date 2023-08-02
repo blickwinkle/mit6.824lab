@@ -43,11 +43,11 @@ var (
 	ErrOutRange = fmt.Errorf("out of range")
 )
 
-const heartbeatTimeout = time.Duration(60) * time.Millisecond
+const heartbeatTimeout = time.Duration(80) * time.Millisecond
 
-const electionTimeout = time.Duration(100) * time.Millisecond
+const electionTimeout = time.Duration(150) * time.Millisecond
 
-const heartbeatInterval = time.Duration(25) * time.Millisecond
+const heartbeatInterval = time.Duration(32) * time.Millisecond
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -213,7 +213,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-
+	// latch     Latchs.Latch
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -723,7 +723,7 @@ func (rf *Raft) handleSendSnap(server int) bool {
 		Data:              rf.log.LastSnapshot,
 		Done:              true,
 	}
-
+	// beforeNextIdx := rf.nextIndex[server]
 	reply := &InstallSnapshotReply{}
 	isSend := false
 	rf.mu.Unlock()
@@ -745,86 +745,93 @@ func (rf *Raft) broadcastHeartbeatOrLog() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(i int) {
-				for {
-					rf.mu.Lock()
-					if rf.role != Leader {
+				//for {
+				rf.mu.Lock()
+				if rf.role != Leader {
+					rf.mu.Unlock()
+					return
+				}
+				// rf.leaderCommit()
+				preTerm, err := rf.log.Term(rf.nextIndex[i] - 1)
+				for err != nil {
+					if !rf.handleSendSnap(i) || rf.role != Leader {
 						rf.mu.Unlock()
 						return
 					}
-					// rf.leaderCommit()
-					preTerm, err := rf.log.Term(rf.nextIndex[i] - 1)
-					if err != nil {
-						if !rf.handleSendSnap(i) || rf.role != Leader {
-							rf.mu.Unlock()
-							return
-						}
-						preTerm, err = rf.log.Term(rf.nextIndex[i] - 1)
-						if err != nil {
-							panic("Error in broadcastHeartbeatOrLog")
-						}
-					}
-					args := &AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PrevLogIndex: rf.nextIndex[i] - 1,
-						PrevLogTerm:  preTerm,
-						//	Entries:      rf.log[rf.nextIndex[i]:],
-						Entries:      rf.log.getLogEntriesFrom(rf.nextIndex[i]),
-						LeaderCommit: rf.commitIndex,
-					}
+					preTerm, err = rf.log.Term(rf.nextIndex[i] - 1)
+					// if err != nil {
+					// 	// rf.mu.Unlock()
+					// 	// return
+					// 	panic("Error in broadcastHeartbeatOrLog")
+					// }
+				}
+				args := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  preTerm,
+					//	Entries:      rf.log[rf.nextIndex[i]:],
+					Entries:      rf.log.getLogEntriesFrom(rf.nextIndex[i]),
+					LeaderCommit: rf.commitIndex,
+				}
+				rf.mu.Unlock()
+				reply := &AppendEntriesReply{}
+				if !rf.sendAppendEntries(i, args, reply) {
+					return
+				}
+				// rf.mu.Lock()
+				// if rf.role != Leader {
+				// 	rf.mu.Unlock()
+				// 	return
+				// }
+				// rf.mu.Unlock()
+				if reply.Success {
+					rf.mu.Lock()
+					rf.nextIndex[i] = len(args.Entries) + args.PrevLogIndex + 1
+					rf.matchIndex[i] = len(args.Entries) + args.PrevLogIndex
+					rf.leaderCommit()
 					rf.mu.Unlock()
-					reply := &AppendEntriesReply{}
-					if !rf.sendAppendEntries(i, args, reply) {
+					return
+				} else {
+					PrettyDebug(dLeader, fmt.Sprintf("L%d send log to %d failed, nextind %d replyTerm %d XTerm %d XIdx %d XLen %d", rf.me, i, rf.nextIndex[i], reply.Term, reply.XTerm, reply.XIdx, reply.XLen))
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.convertToFollwer()
+
+						rf.mu.Unlock()
+						PrettyDebug(dLeader, fmt.Sprintf("L%d become follower, curr term %d", rf.me, rf.currentTerm))
 						return
 					}
-					// rf.mu.Lock()
-					// if rf.role != Leader {
+					// rf.nextIndex[i] = max(rf.nextIndex[i]-1, 1)
+					// if rf.nextIndex[i] != args.PrevLogIndex+1 {
 					// 	rf.mu.Unlock()
 					// 	return
 					// }
-					// rf.mu.Unlock()
-					if reply.Success {
-						rf.mu.Lock()
-						rf.nextIndex[i] = len(args.Entries) + args.PrevLogIndex + 1
-						rf.matchIndex[i] = len(args.Entries) + args.PrevLogIndex
-						rf.leaderCommit()
-						rf.mu.Unlock()
-						return
-					} else {
-						PrettyDebug(dLeader, fmt.Sprintf("L%d send log to %d failed, nextind %d replyTerm %d", rf.me, i, rf.nextIndex[i], reply.Term))
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.convertToFollwer()
-
-							rf.mu.Unlock()
-							PrettyDebug(dLeader, fmt.Sprintf("L%d become follower, curr term %d", rf.me, rf.currentTerm))
-							return
-						}
-						// rf.nextIndex[i] = max(rf.nextIndex[i]-1, 1)
-						if reply.XTerm != -1 {
-							rf.nextIndex[i] = reply.XIdx
-							for j := args.PrevLogIndex; j >= 0; j-- {
-								term, err := rf.log.Term(j)
-								if err != nil {
-									rf.nextIndex[i] = 0
-									break
-								}
-								if term == reply.XTerm {
-									rf.nextIndex[i] = j + 1
-									break
-								}
+					if reply.XTerm != -1 {
+						rf.nextIndex[i] = reply.XIdx
+						for j := args.PrevLogIndex; j >= 0; j-- {
+							term, err := rf.log.Term(j)
+							if err != nil {
+								rf.nextIndex[i] = 0
+								break
 							}
-						} else {
-							rf.nextIndex[i] = reply.XLen
+							if term == reply.XTerm {
+								rf.nextIndex[i] = j + 1
+								break
+							}
 						}
-
-						rf.mu.Unlock()
+					} else {
+						rf.nextIndex[i] = rf.nextIndex[i] - reply.XLen
 					}
+
+					rf.mu.Unlock()
 				}
+				//}
 			}(i)
 		}
 	}
+
 }
 
 func max(i1, i2 int) int {

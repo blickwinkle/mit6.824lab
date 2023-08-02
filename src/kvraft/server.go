@@ -99,7 +99,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		select {
 		case waitInfo = <-ch:
 			goto OUTER_LOOP
-		case <-time.After(10 * d):
+		case <-time.After(3 * d):
 			if kv.killed() {
 				return
 			}
@@ -159,7 +159,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		select {
 		case waitInfo = <-ch:
 			goto OUTER_LOOP
-		case <-time.After(10 * d):
+		case <-time.After(3 * d):
 			// if kv.killed() {
 			// 	return
 			// }
@@ -186,7 +186,10 @@ OUTER_LOOP:
 func (kv *KVServer) handleMsg(ch <-chan *raft.ApplyMsg) {
 	for msg := range ch {
 		if msg.CommandValid {
-			op := msg.Command.(Op)
+			op, ok := msg.Command.(Op)
+			if !ok {
+				continue // ignore
+			}
 
 			kv.mu.Lock()
 			kv.applyOP(&op)
@@ -221,7 +224,7 @@ func (kv *KVServer) loop() {
 			msgCh <- &msg
 
 			// DPrintf("S%d msgCh len %v", kv.me, len(msgCh))
-		case <-time.After(3 * d):
+		case <-time.After(2 * d):
 			if kv.killed() {
 				return
 			}
