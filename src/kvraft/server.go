@@ -231,8 +231,9 @@ func (kv *KVServer) loop() {
 
 			go func() {
 				_, isLeader := kv.rf.GetState()
-				kv.mu.Lock()
 				if !isLeader {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
 					for _, waitChannel := range kv.waitChannel {
 						if waitChannel != nil {
 							waitChannel <- &CommitInfo{op: nil, isLeader: isLeader}
@@ -243,7 +244,6 @@ func (kv *KVServer) loop() {
 						delete(kv.waitChannel, k)
 					}
 				}
-				kv.mu.Unlock()
 			}()
 		}
 	}
