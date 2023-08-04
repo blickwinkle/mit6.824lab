@@ -6,12 +6,43 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"6.824/shardctrler"
 )
+
+const (
+	cliOpTimeOut = 150 * time.Millisecond
+	leaderCheckTimeOut = 100 * time.Millisecond
+)
+
+const (
+	Working = iota
+	Acquiring
+	Expired
+)
+
+const (
+	GET = "Get"
+	PUT = "Put"
+	APP = "Append"
+	
+)
+
+type RecordReply struct {
+	OpID     int64
+	ClientID int64
+	Reply    *GetReply
+}
+
+
+type CommitInfo struct {
+	OpID    int64
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	
 }
 
 type ShardKV struct {
@@ -25,10 +56,59 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	mck            *shardctrler.Clerk
+	CurrConfig     *shardctrler.Config
+	WaitCh         map[int]chan *CommitInfo
+	ShardState     map[int]int
+	ShardStore     map[int]map[string]string
+	ShardLastReply map[int]map[int64]*RecordReply // Shard -> ClientID -> LastReply
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	shard := key2shard(args.Key)
+	kv.mu.Lock()
+	if kv.ShardState[shard] != Working {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	if kv.ShardLastReply[shard][args.ClientID] != nil && kv.ShardLastReply[shard][args.ClientID].OpID == args.OpID {
+		reply.Value = kv.ShardLastReply[shard][args.ClientID].Reply.Value
+		reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	if _, _, isleader := kv.rf.Start(*args); !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	ch := make(chan *CommitInfo, 1)
+	kv.mu.Lock()
+	kv.WaitCh[args.ClientID] = ch
+	kv.mu.Unlock()
+	var cmminfo *CommitInfo
+	select {
+	case cmminfo<-ch:
+	case <-time.After(cliOpTimeOut):
+		kv.mu.Lock()
+		kv.WaitCh[args.ClientID] = nil
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+	
+
+
+	
+	
+
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -89,6 +169,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	return kv
+}
+
+func (kv *ShardKV) checkConfigChange() {
+	for {
+		kv.mu.Lock()
+		newConfig := kv.mck.Query(kv.CurrConfig.Num + 1)
+		if newConfig.Num == kv.CurrConfig.Num+1 {
+
+		kv.mu.Unlock()
+		// kv.CurrConfig = kv.mck.Query(kv.CurrConfig.Num + 1)
+	}
 }
