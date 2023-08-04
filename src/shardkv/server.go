@@ -2,6 +2,7 @@ package shardkv
 
 import (
 	"sync"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -10,8 +11,9 @@ import (
 )
 
 const (
-	cliOpTimeOut = 150 * time.Millisecond
-	leaderCheckTimeOut = 100 * time.Millisecond
+	cliOpTimeOut              = 150 * time.Millisecond
+	leaderCheckDuration       = 100 * time.Millisecond
+	configChangeCheckDuration = 100 * time.Millisecond
 )
 
 const (
@@ -24,7 +26,6 @@ const (
 	GET = "Get"
 	PUT = "Put"
 	APP = "Append"
-	
 )
 
 type RecordReply struct {
@@ -33,20 +34,19 @@ type RecordReply struct {
 	Reply    *GetReply
 }
 
-
 type CommitInfo struct {
-	OpID    int64
+	OpID int64
 }
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	
+
 }
 
 type ShardKV struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -58,7 +58,7 @@ type ShardKV struct {
 	// Your definitions here.
 	mck            *shardctrler.Clerk
 	CurrConfig     *shardctrler.Config
-	WaitCh         map[int]chan *CommitInfo
+	WaitCh         map[int64]chan *CommitInfo
 	ShardState     map[int]int
 	ShardStore     map[int]map[string]string
 	ShardLastReply map[int]map[int64]*RecordReply // Shard -> ClientID -> LastReply
@@ -71,19 +71,19 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	shard := key2shard(args.Key)
-	kv.mu.Lock()
+	kv.mu.RLock()
 	if kv.ShardState[shard] != Working {
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		reply.Err = ErrWrongGroup
 		return
 	}
 	if kv.ShardLastReply[shard][args.ClientID] != nil && kv.ShardLastReply[shard][args.ClientID].OpID == args.OpID {
 		reply.Value = kv.ShardLastReply[shard][args.ClientID].Reply.Value
 		reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 	if _, _, isleader := kv.rf.Start(*args); !isleader {
 		reply.Err = ErrWrongLeader
 		return
@@ -94,7 +94,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 	var cmminfo *CommitInfo
 	select {
-	case cmminfo<-ch:
+	case cmminfo = <-ch:
 	case <-time.After(cliOpTimeOut):
 		kv.mu.Lock()
 		kv.WaitCh[args.ClientID] = nil
@@ -103,11 +103,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Lock()
-	
-
-
-	
-	
 
 }
 
@@ -174,13 +169,19 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	return kv
 }
 
-func (kv *ShardKV) checkConfigChange() {
-	for {
-		kv.mu.Lock()
+func (kv *ShardKV) checkConfigChangeLoop() {
+	for ; ; time.Sleep(configChangeCheckDuration) {
+		if _, isleader := kv.rf.GetState(); !isleader {
+			continue
+		}
+		kv.mu.RLock()
+		currConfig := kv.CurrConfig
+		kv.mu.RUnlock()
 		newConfig := kv.mck.Query(kv.CurrConfig.Num + 1)
-		if newConfig.Num == kv.CurrConfig.Num+1 {
-
-		kv.mu.Unlock()
+		if newConfig.Num != kv.CurrConfig.Num+1 {
+			continue
+		}
+		kv.rf.Start(newConfig)
 		// kv.CurrConfig = kv.mck.Query(kv.CurrConfig.Num + 1)
 	}
 }
