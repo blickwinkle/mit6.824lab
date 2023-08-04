@@ -108,6 +108,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
 }
 
 // the tester calls Kill() when a ShardKV instance won't
