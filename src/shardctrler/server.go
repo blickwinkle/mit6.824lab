@@ -50,6 +50,10 @@ type Op struct {
 	// Your data here.
 }
 
+func init() {
+	labgob.Register(Config{})
+}
+
 // 计算平衡每个组的shard数量后的config
 func (sc *ShardCtrler) rebalance(config *Config) {
 	// newConfig := *config

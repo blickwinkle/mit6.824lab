@@ -1,6 +1,7 @@
 package shardkv
 
 import (
+	"bytes"
 	"sync"
 	"time"
 
@@ -33,7 +34,7 @@ const (
 type RecordReply struct {
 	OpID     int64
 	ClientID int64
-	Reply    GetReply
+	Reply    *GetReply
 }
 
 type CommitInfo struct {
@@ -47,8 +48,8 @@ type ShardUpdateInfo struct {
 }
 
 type ConfigChangeInfo struct {
-	OpID      int64
-	config   shardctrler.Config
+	OpID   int64
+	Config shardctrler.Config
 }
 
 type Op struct {
@@ -69,13 +70,14 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	peresister *raft.Persister
 	mck        *shardctrler.Clerk
-	CurrConfig *shardctrler.Config
+	CurrConfig shardctrler.Config
 	// ClientID       int64
 	WaitCh         map[int64]chan *CommitInfo
 	ShardState     map[int]map[int]int // ConfigNum -> Shard -> State
 	ShardStore     map[int]map[string]string
-	ShardLastReply map[int]map[int64]RecordReply // Shard -> ClientID -> LastReply
+	ShardLastReply map[int]map[int64]*RecordReply // Shard -> ClientID -> LastReply
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -229,8 +231,28 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
+	kv.peresister = persister
+	kv.ShardLastReply = make(map[int]map[int64]*RecordReply)
+	kv.ShardStore = make(map[int]map[string]string)
+	kv.ShardState = make(map[int]map[int]int)
+	kv.WaitCh = make(map[int64]chan *CommitInfo)
+	kv.CurrConfig = kv.mck.Query(0)
+	kv.restore(kv.peresister.ReadSnapshot())
+	go kv.msgloop()
+	go kv.checkConfigChangeLoop()
+	go kv.acquirShardLoop()
 	return kv
+}
+
+func init() {
+	labgob.Register(Op{})
+	labgob.Register(GetArgs{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(GetShardArgs{})
+	labgob.Register(GetShardReply{})
+	labgob.Register(ConfigChangeInfo{})
+	labgob.Register(ShardUpdateInfo{})
+	labgob.Register(RecordReply{})
 }
 
 func (kv *ShardKV) checkConfigChangeLoop() {
@@ -248,7 +270,7 @@ func (kv *ShardKV) checkConfigChangeLoop() {
 		if newConfig.Num != currConfig.Num+1 {
 			continue
 		}
-		kv.rf.Start(newConfig)
+		kv.rf.Start(ConfigChangeInfo{OpID: nrand(), Config: newConfig})
 		// kv.CurrConfig = kv.mck.Query(kv.CurrConfig.Num + 1)
 	}
 }
@@ -286,7 +308,7 @@ func (kv *ShardKV) acquirShardLoop() {
 								return
 							}
 							kv.mu.RUnlock()
-							kv.rf.Start(ConfigChangeInfo{OpID: args.OpID, Shard: shard, ShardInfo: reply})
+							kv.rf.Start(ShardUpdateInfo{OpID: args.OpID, Shard: shard, ShardInfo: reply})
 							return
 						} else if ok && reply.Err == ErrWrongGroup {
 							return
@@ -357,7 +379,7 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 		} else {
 			reply.Err = ErrNoKey
 		}
-		kv.ShardLastReply[shard][op.ClientID] = RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: reply}
+		kv.ShardLastReply[shard][op.ClientID] = &RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: &reply}
 		return op.ClientID, op.OpID
 	case PutAppendArgs:
 		shard := key2shard(op.Key)
@@ -372,23 +394,49 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 			kv.ShardStore[shard][op.Key] += op.Value
 		}
 		reply.Err = OK
-		kv.ShardLastReply[shard][op.ClientID] = RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: reply}
+		kv.ShardLastReply[shard][op.ClientID] = &RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: &reply}
 		return op.ClientID, op.OpID
 	case GetShardArgs:
 		return op.OpID, op.OpID
 	case ConfigChangeInfo:
-		if op.config.Num != kv.CurrConfig.Num+1 {
+		if op.Config.Num != kv.CurrConfig.Num+1 {
 			return op.OpID, op.OpID
 		}
-		for shard, gid := range op.config.Shards {
+		copyConfig := op.Config
+		copyConfig.Groups = make(map[int][]string)
+		for k, v := range op.Config.Groups {
+			copyConfig.Groups[k] = make([]string, len(v))
+			copy(copyConfig.Groups[k], v)
+		}
+		kv.CurrConfig = copyConfig
+		for shard, gid := range op.Config.Shards {
 			if gid == kv.gid {
 				if kv.ShardState[kv.CurrConfig.Num][shard] != Working {
-				kv.ShardState[kv.CurrConfig.Num][shard] = Acquiring
-			} else {
-				kv.ShardState[kv.CurrConfig.Num][shard] = Expired
+					kv.ShardState[kv.CurrConfig.Num][shard] = Acquiring
+				} else {
+					kv.ShardState[kv.CurrConfig.Num][shard] = Expired
+				}
 			}
+
 		}
 
+		return op.OpID, op.OpID
+	case ShardUpdateInfo:
+		if kv.ShardState[kv.CurrConfig.Num][op.Shard] != Acquiring {
+			return op.OpID, op.OpID
+		}
+		kv.ShardState[kv.CurrConfig.Num][op.Shard] = Working
+		kv.ShardStore[op.Shard] = make(map[string]string)
+		for k, v := range op.ShardInfo.ShardStore {
+			kv.ShardStore[op.Shard][k] = v
+		}
+		kv.ShardLastReply[op.Shard] = make(map[int64]*RecordReply)
+		for k, v := range op.ShardInfo.ShardRecordReply {
+			kv.ShardLastReply[op.Shard][k] = v
+		}
+		return op.OpID, op.OpID
+	default:
+		panic("unknown op type")
 	}
 }
 func (kv *ShardKV) handleMsg(ch <-chan *raft.ApplyMsg) {
@@ -396,14 +444,14 @@ func (kv *ShardKV) handleMsg(ch <-chan *raft.ApplyMsg) {
 		if msg.CommandValid {
 
 			kv.mu.Lock()
-			kv.applyOP(&op)
+			clid, opid := kv.applyOP(msg.Command)
 
-			if waitChannel, ok := kv.WaitCh[op.ClientID]; ok && waitChannel != nil {
-				waitChannel <- &CommitInfo{OpID: op.OpID}
-				kv.WaitCh[op.ClientID] = nil
+			if waitChannel, ok := kv.WaitCh[clid]; ok && waitChannel != nil {
+				waitChannel <- &CommitInfo{opid}
+				kv.WaitCh[clid] = nil
 				close(waitChannel)
 			}
-			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+			if kv.maxraftstate != -1 && kv.peresister.RaftStateSize() >= kv.maxraftstate {
 				kv.rf.Snapshot(msg.CommandIndex, kv.store())
 			}
 			kv.mu.Unlock()
@@ -438,17 +486,50 @@ func (kv *ShardKV) msgloop() {
 				if !isLeader {
 					kv.mu.Lock()
 					defer kv.mu.Unlock()
-					for _, waitChannel := range sc.waitChannel {
+					for _, waitChannel := range kv.WaitCh {
 						if waitChannel != nil {
 							waitChannel <- nil
 							close(waitChannel)
 						}
 					}
-					for k := range kv.waitChannel {
-						delete(kv.waitChannel, k)
+					for k := range kv.WaitCh {
+						delete(kv.WaitCh, k)
 					}
 				}
 			}()
 		}
+	}
+}
+
+func (kv *ShardKV) store() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.ShardStore)
+	e.Encode(kv.ShardLastReply)
+	e.Encode(kv.ShardState)
+	e.Encode(kv.CurrConfig)
+	return w.Bytes()
+}
+
+func (kv *ShardKV) restore(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var ShardStore map[int]map[string]string
+	var ShardLastReply map[int]map[int64]*RecordReply
+	var ShardState map[int]map[int]int
+	var CurrConfig shardctrler.Config
+	if d.Decode(&ShardStore) != nil ||
+		d.Decode(&ShardLastReply) != nil ||
+		d.Decode(&ShardState) != nil ||
+		d.Decode(&CurrConfig) != nil {
+		panic("failed to restore")
+	} else {
+		kv.ShardStore = ShardStore
+		kv.ShardLastReply = ShardLastReply
+		kv.ShardState = ShardState
+		kv.CurrConfig = CurrConfig
 	}
 }

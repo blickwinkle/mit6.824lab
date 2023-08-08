@@ -57,5 +57,5 @@ type GetShardArgs struct {
 type GetShardReply struct {
 	Err              Err
 	ShardStore       map[string]string
-	ShardRecordReply map[int64]RecordReply
+	ShardRecordReply map[int64]*RecordReply
 }
