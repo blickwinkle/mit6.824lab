@@ -2,13 +2,14 @@ package shardkv
 
 import (
 	"bytes"
-	"sync"
+	"log"
 	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
 	"6.824/shardctrler"
+	"github.com/sasha-s/go-deadlock"
 )
 
 const (
@@ -19,10 +20,18 @@ const (
 	msgLoopTimeOut            = 100 * time.Millisecond
 )
 
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+}
+
 const (
-	Working = iota
+	Expired = iota
 	Acquiring
-	Expired
+	Working
 )
 
 const (
@@ -60,7 +69,7 @@ type Op struct {
 }
 
 type ShardKV struct {
-	mu           sync.RWMutex
+	mu           deadlock.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -70,9 +79,10 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	peresister *raft.Persister
-	mck        *shardctrler.Clerk
-	CurrConfig shardctrler.Config
+	peresister   *raft.Persister
+	mck          *shardctrler.Clerk
+	CurrConfig   shardctrler.Config
+	BeforeConfig shardctrler.Config
 	// ClientID       int64
 	WaitCh         map[int64]chan *CommitInfo
 	ShardState     map[int]map[int]int // ConfigNum -> Shard -> State
@@ -121,10 +131,16 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 	// kv.WaitCh[args.ClientID] = nil
-	if cmminfo != nil && cmminfo.OpID == args.OpID && kv.ShardLastReply[shard][args.ClientID].OpID == args.OpID {
-		reply.Value = kv.ShardLastReply[shard][args.ClientID].Reply.Value
-		reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
-		return
+	if cmminfo != nil && cmminfo.OpID == args.OpID {
+		if _, ok := kv.ShardLastReply[shard][args.ClientID]; !ok {
+			reply.Err = ErrWrongGroup
+			return
+		}
+		if kv.ShardLastReply[shard][args.ClientID].OpID == args.OpID {
+			reply.Value = kv.ShardLastReply[shard][args.ClientID].Reply.Value
+			reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
+			return
+		}
 	}
 	reply.Err = ErrWrongLeader
 }
@@ -152,6 +168,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	// DPrintf("S%d PutAppend key %v value %v op %v", kv.me, args.Key, args.Value, args.Op)
 	ch := make(chan *CommitInfo, 1)
 	kv.mu.Lock()
 	kv.WaitCh[args.ClientID] = ch
@@ -160,6 +177,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case cmminfo = <-ch:
 	case <-time.After(cliOpTimeOut):
+		// DPrintf("S%d PutAppend key %v value %v op %v timeout", kv.me, args.Key, args.Value, args.Op)
 		kv.mu.Lock()
 		kv.WaitCh[args.ClientID] = nil
 		kv.mu.Unlock()
@@ -169,9 +187,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 	// kv.WaitCh[args.ClientID] = nil
-	if cmminfo != nil && cmminfo.OpID == args.OpID && kv.ShardLastReply[shard][args.ClientID].OpID == args.OpID {
-		reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
-		return
+	if cmminfo != nil && cmminfo.OpID == args.OpID {
+		if _, ok := kv.ShardLastReply[shard][args.ClientID]; !ok {
+			reply.Err = ErrWrongGroup
+			return
+		}
+		if kv.ShardLastReply[shard][args.ClientID].OpID == args.OpID {
+			reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
+			return
+		}
+
 	}
 	reply.Err = ErrWrongLeader
 }
@@ -270,6 +295,7 @@ func (kv *ShardKV) checkConfigChangeLoop() {
 		if newConfig.Num != currConfig.Num+1 {
 			continue
 		}
+		DPrintf("S%d Commit ConfigChange %v", kv.me, newConfig)
 		kv.rf.Start(ConfigChangeInfo{OpID: nrand(), Config: newConfig})
 		// kv.CurrConfig = kv.mck.Query(kv.CurrConfig.Num + 1)
 	}
@@ -281,33 +307,34 @@ func (kv *ShardKV) acquirShardLoop() {
 			continue
 		}
 		kv.mu.RLock()
-		currConfig := kv.CurrConfig
 
-		for shard, gid := range currConfig.Shards {
-			if gid == kv.gid && kv.ShardState[currConfig.Num][shard] == Acquiring {
+		for shard, gid := range kv.CurrConfig.Shards {
+			if gid == kv.gid && kv.ShardState[kv.CurrConfig.Num][shard] == Acquiring {
 				go func(shard int) {
-					args := &GetShardArgs{Shard: shard, ConfigNum: currConfig.Num, Gid: kv.gid, OpID: nrand()}
+					kv.mu.RLock()
+					defer kv.mu.RUnlock()
+					args := &GetShardArgs{Shard: shard, ConfigNum: kv.CurrConfig.Num, Gid: kv.gid, OpID: nrand()}
 					if _, isleader := kv.rf.GetState(); !isleader {
 						return
 					}
-					kv.mu.RLock()
-					if kv.ShardState[currConfig.Num][shard] != Acquiring {
-						kv.mu.RUnlock()
+
+					if kv.ShardState[kv.CurrConfig.Num][shard] != Acquiring {
 						return
 					}
-					kv.mu.RUnlock()
 					var reply GetShardReply
-					for _, sname := range currConfig.Groups[currConfig.Shards[shard]] {
+					for _, sname := range kv.BeforeConfig.Groups[kv.BeforeConfig.Shards[shard]] {
 						if _, isleader := kv.rf.GetState(); !isleader {
 							return
 						}
-						if ok := kv.make_end(sname).Call("ShardKV.AcquirShard", args, &reply); ok && reply.Err == OK {
-							kv.mu.RLock()
+						kv.mu.RUnlock()
+						ok := kv.make_end(sname).Call("ShardKV.AcquirShard", args, &reply)
+						kv.mu.RLock()
+						if ok && reply.Err == OK {
+
 							if kv.ShardState[kv.CurrConfig.Num][shard] != Acquiring {
-								kv.mu.RUnlock()
 								return
 							}
-							kv.mu.RUnlock()
+							// DPrintf("S%d AcquirShard shard %v", kv.me, shard)
 							kv.rf.Start(ShardUpdateInfo{OpID: args.OpID, Shard: shard, ShardInfo: reply})
 							return
 						} else if ok && reply.Err == ErrWrongGroup {
@@ -327,6 +354,7 @@ func (kv *ShardKV) AcquirShard(args *GetShardArgs, reply *GetShardReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
 	kv.mu.RLock()
 	if kv.ShardState[args.ConfigNum] == nil || kv.ShardState[args.ConfigNum][args.Shard] != Expired {
 		reply.Err = ErrWrongGroup
@@ -334,7 +362,7 @@ func (kv *ShardKV) AcquirShard(args *GetShardArgs, reply *GetShardReply) {
 		return
 	}
 	kv.mu.RUnlock()
-
+	DPrintf("S%d BeAcquirShard shard %v", kv.me, args.Shard)
 	if _, _, isleader := kv.rf.Start(*args); !isleader {
 		reply.Err = ErrWrongLeader
 		return
@@ -366,6 +394,7 @@ func (kv *ShardKV) AcquirShard(args *GetShardArgs, reply *GetShardReply) {
 }
 
 func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
+	DPrintf("S%d applyOP %v", kv.me, op)
 	switch op := op.(type) {
 	case GetArgs:
 		shard := key2shard(op.Key)
@@ -379,7 +408,11 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 		} else {
 			reply.Err = ErrNoKey
 		}
+		if _, ok := kv.ShardLastReply[shard]; !ok {
+			kv.ShardLastReply[shard] = make(map[int64]*RecordReply)
+		}
 		kv.ShardLastReply[shard][op.ClientID] = &RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: &reply}
+		DPrintf("S%d Get key %v value %v", kv.me, op.Key, reply.Value)
 		return op.ClientID, op.OpID
 	case PutAppendArgs:
 		shard := key2shard(op.Key)
@@ -387,6 +420,9 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 			return op.ClientID, op.OpID
 		}
 		var reply GetReply
+		if _, ok := kv.ShardStore[shard]; !ok {
+			kv.ShardStore[shard] = make(map[string]string)
+		}
 		if op.Op == PUT {
 			kv.ShardStore[shard][op.Key] = op.Value
 		}
@@ -394,9 +430,14 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 			kv.ShardStore[shard][op.Key] += op.Value
 		}
 		reply.Err = OK
+		if _, ok := kv.ShardLastReply[shard]; !ok {
+			kv.ShardLastReply[shard] = make(map[int64]*RecordReply)
+		}
 		kv.ShardLastReply[shard][op.ClientID] = &RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: &reply}
+		DPrintf("S%d PutAppend key %v value %v", kv.me, op.Key, op.Value)
 		return op.ClientID, op.OpID
 	case GetShardArgs:
+		DPrintf("S%d GetShard shard %v", kv.me, op.Shard)
 		return op.OpID, op.OpID
 	case ConfigChangeInfo:
 		if op.Config.Num != kv.CurrConfig.Num+1 {
@@ -408,18 +449,33 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 			copyConfig.Groups[k] = make([]string, len(v))
 			copy(copyConfig.Groups[k], v)
 		}
-		kv.CurrConfig = copyConfig
+
+		// kv.CurrConfig = copyConfig
+		kv.ShardState[copyConfig.Num] = make(map[int]int)
+
 		for shard, gid := range op.Config.Shards {
+			if kv.CurrConfig.Num == 0 {
+				if gid == kv.gid {
+					kv.ShardState[copyConfig.Num][shard] = Working
+				} else {
+					kv.ShardState[copyConfig.Num][shard] = Expired
+				}
+				continue
+			}
 			if gid == kv.gid {
 				if kv.ShardState[kv.CurrConfig.Num][shard] != Working {
-					kv.ShardState[kv.CurrConfig.Num][shard] = Acquiring
+					kv.ShardState[copyConfig.Num][shard] = Acquiring
 				} else {
-					kv.ShardState[kv.CurrConfig.Num][shard] = Expired
+					kv.ShardState[copyConfig.Num][shard] = Working
 				}
+			} else {
+				kv.ShardState[copyConfig.Num][shard] = Expired
 			}
 
 		}
-
+		kv.BeforeConfig = kv.CurrConfig
+		kv.CurrConfig = copyConfig
+		DPrintf("S%d ConfigChange %v", kv.me, op.Config)
 		return op.OpID, op.OpID
 	case ShardUpdateInfo:
 		if kv.ShardState[kv.CurrConfig.Num][op.Shard] != Acquiring {
@@ -434,6 +490,7 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 		for k, v := range op.ShardInfo.ShardRecordReply {
 			kv.ShardLastReply[op.Shard][k] = v
 		}
+		DPrintf("S%d ShardUpdate shard %v", kv.me, op.Shard)
 		return op.OpID, op.OpID
 	default:
 		panic("unknown op type")

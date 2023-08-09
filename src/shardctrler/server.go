@@ -4,12 +4,12 @@ import (
 	"encoding/gob"
 	"log"
 	"sort"
-	"sync"
 	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"github.com/sasha-s/go-deadlock"
 )
 
 const Debug = false
@@ -35,7 +35,7 @@ type RecordReply struct {
 }
 
 type ShardCtrler struct {
-	mu      sync.Mutex
+	mu      deadlock.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
