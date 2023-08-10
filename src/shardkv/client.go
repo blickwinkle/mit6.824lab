@@ -58,6 +58,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.make_end = make_end
 	// You'll have to add code here.
 	ck.ClientID = nrand()
+	ck.GidToLeader = make(map[int]int)
 	return ck
 }
 

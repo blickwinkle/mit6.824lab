@@ -14,9 +14,9 @@ import (
 
 const (
 	cliOpTimeOut              = 150 * time.Millisecond
-	leaderCheckDuration       = 100 * time.Millisecond
-	configChangeCheckDuration = 100 * time.Millisecond
-	acquirShardDuration       = 100 * time.Millisecond
+	leaderCheckDuration       = 80 * time.Millisecond
+	configChangeCheckDuration = 35 * time.Millisecond
+	acquirShardDuration       = 50 * time.Millisecond
 	msgLoopTimeOut            = 100 * time.Millisecond
 )
 
@@ -244,6 +244,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv := new(ShardKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+
+	// Disable SnapShot
+	// kv.maxraftstate = -1
+
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.ctrlers = ctrlers
@@ -286,6 +290,19 @@ func (kv *ShardKV) checkConfigChangeLoop() {
 			continue
 		}
 		kv.mu.RLock()
+		// 如果还有未完成的配置变更，有shard在acquire，则不进行
+		isContinue := true
+		for _, state := range kv.ShardState[kv.CurrConfig.Num] {
+			if state == Acquiring {
+
+				isContinue = false
+				break
+			}
+		}
+		if !isContinue {
+			kv.mu.RUnlock()
+			continue
+		}
 		currConfig := kv.CurrConfig
 		kv.mu.RUnlock()
 		newConfig := kv.mck.Query(currConfig.Num + 1)
@@ -394,7 +411,7 @@ func (kv *ShardKV) AcquirShard(args *GetShardArgs, reply *GetShardReply) {
 }
 
 func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
-	DPrintf("S%d applyOP %v", kv.me, op)
+	// DPrintf("S%d applyOP %v", kv.me, op)
 	switch op := op.(type) {
 	case GetArgs:
 		shard := key2shard(op.Key)
@@ -413,6 +430,9 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 		}
 		kv.ShardLastReply[shard][op.ClientID] = &RecordReply{OpID: op.OpID, ClientID: op.ClientID, Reply: &reply}
 		DPrintf("S%d Get key %v value %v", kv.me, op.Key, reply.Value)
+		if reply.Value == "" {
+			DPrintf("S%d Get key %v value is empty", kv.me, op.Key)
+		}
 		return op.ClientID, op.OpID
 	case PutAppendArgs:
 		shard := key2shard(op.Key)
@@ -482,11 +502,16 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 			return op.OpID, op.OpID
 		}
 		kv.ShardState[kv.CurrConfig.Num][op.Shard] = Working
-		kv.ShardStore[op.Shard] = make(map[string]string)
+		// kv.ShardStore[op.Shard] = make(map[string]string)
+		if _, ok := kv.ShardStore[op.Shard]; !ok {
+			kv.ShardStore[op.Shard] = make(map[string]string)
+		}
 		for k, v := range op.ShardInfo.ShardStore {
 			kv.ShardStore[op.Shard][k] = v
 		}
-		kv.ShardLastReply[op.Shard] = make(map[int64]*RecordReply)
+		if _, ok := kv.ShardLastReply[op.Shard]; !ok {
+			kv.ShardLastReply[op.Shard] = make(map[int64]*RecordReply)
+		}
 		for k, v := range op.ShardInfo.ShardRecordReply {
 			kv.ShardLastReply[op.Shard][k] = v
 		}
@@ -565,6 +590,8 @@ func (kv *ShardKV) store() []byte {
 	e.Encode(kv.ShardLastReply)
 	e.Encode(kv.ShardState)
 	e.Encode(kv.CurrConfig)
+	e.Encode(kv.BeforeConfig)
+
 	return w.Bytes()
 }
 
@@ -578,15 +605,18 @@ func (kv *ShardKV) restore(snapshot []byte) {
 	var ShardLastReply map[int]map[int64]*RecordReply
 	var ShardState map[int]map[int]int
 	var CurrConfig shardctrler.Config
+	var BeforeConfig shardctrler.Config
 	if d.Decode(&ShardStore) != nil ||
 		d.Decode(&ShardLastReply) != nil ||
 		d.Decode(&ShardState) != nil ||
-		d.Decode(&CurrConfig) != nil {
+		d.Decode(&CurrConfig) != nil ||
+		d.Decode(&BeforeConfig) != nil {
 		panic("failed to restore")
 	} else {
 		kv.ShardStore = ShardStore
 		kv.ShardLastReply = ShardLastReply
 		kv.ShardState = ShardState
 		kv.CurrConfig = CurrConfig
+		kv.BeforeConfig = BeforeConfig
 	}
 }
