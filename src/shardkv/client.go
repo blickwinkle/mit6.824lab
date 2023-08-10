@@ -29,6 +29,13 @@ func key2shard(key string) int {
 	return shard
 }
 
+// func nrandwithtime() int64 {
+// 	max := big.NewInt(int64(1) << 62)
+// 	bigx, _ := rand.Int(rand.Reader, max)
+// 	x := bigx.Int64() + time.Now().UnixNano()
+// 	return x
+// }
+
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -67,7 +74,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{ClientID: ck.ClientID, OpID: nrand()}
+	args := GetArgs{ClientID: ck.ClientID, OpID: time.Now().UnixNano()}
 	args.Key = key
 
 	for {
@@ -104,7 +111,7 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{ClientID: ck.ClientID, OpID: nrand()}
+	args := PutAppendArgs{ClientID: ck.ClientID, OpID: time.Now().UnixNano()}
 	args.Key = key
 	args.Value = value
 	args.Op = op

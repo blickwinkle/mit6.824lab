@@ -108,6 +108,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
 		kv.mu.RUnlock()
 		return
+	} else if ok && kv.ShardLastReply[shard][args.ClientID].OpID > args.OpID {
+		panic("OpID error")
 	}
 	kv.mu.RUnlock()
 	if _, _, isleader := kv.rf.Start(*args); !isleader {
@@ -162,6 +164,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = kv.ShardLastReply[shard][args.ClientID].Reply.Err
 		kv.mu.RUnlock()
 		return
+	} else if ok && kv.ShardLastReply[shard][args.ClientID].OpID > args.OpID {
+		panic("OpID error")
 	}
 	kv.mu.RUnlock()
 	if _, _, isleader := kv.rf.Start(*args); !isleader {
@@ -435,8 +439,12 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 		}
 		return op.ClientID, op.OpID
 	case PutAppendArgs:
+
 		shard := key2shard(op.Key)
 		if kv.ShardState[kv.CurrConfig.Num][shard] != Working {
+			return op.ClientID, op.OpID
+		}
+		if _, ok := kv.ShardLastReply[shard][op.ClientID]; ok && kv.ShardLastReply[shard][op.ClientID].OpID >= op.OpID {
 			return op.ClientID, op.OpID
 		}
 		var reply GetReply
