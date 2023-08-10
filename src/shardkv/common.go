@@ -14,6 +14,7 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrNotNeedGC   = "ErrNotNeedGC"
 )
 
 type Err string
@@ -58,4 +59,14 @@ type GetShardReply struct {
 	Err              Err
 	ShardStore       map[string]string
 	ShardRecordReply map[int64]*RecordReply
+}
+
+type GcArgs struct {
+	Shard     int
+	ConfigNum int
+	OpID      int64
+}
+
+type GcReply struct {
+	Err Err
 }

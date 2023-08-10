@@ -286,6 +286,8 @@ func init() {
 	labgob.Register(ConfigChangeInfo{})
 	labgob.Register(ShardUpdateInfo{})
 	labgob.Register(RecordReply{})
+	labgob.Register(GcArgs{})
+	labgob.Register(GcReply{})
 }
 
 func (kv *ShardKV) checkConfigChangeLoop() {
@@ -524,6 +526,14 @@ func (kv *ShardKV) applyOP(op interface{}) (int64, int64) {
 			kv.ShardLastReply[op.Shard][k] = v
 		}
 		DPrintf("S%d ShardUpdate shard %v", kv.me, op.Shard)
+		go kv.requestGC(op.Shard, kv.CurrConfig.Num, kv.BeforeConfig.Groups[kv.BeforeConfig.Shards[op.Shard]])
+		return op.OpID, op.OpID
+	case GcArgs:
+		if kv.ShardState[kv.CurrConfig.Num][op.Shard] != Expired {
+			return op.OpID, op.OpID
+		}
+		delete(kv.ShardStore, op.Shard)
+		delete(kv.ShardLastReply, op.Shard)
 		return op.OpID, op.OpID
 	default:
 		panic("unknown op type")
@@ -627,4 +637,60 @@ func (kv *ShardKV) restore(snapshot []byte) {
 		kv.CurrConfig = CurrConfig
 		kv.BeforeConfig = BeforeConfig
 	}
+}
+
+func (kv *ShardKV) requestGC(shard int, configNum int, snames []string) {
+	args := &GcArgs{Shard: shard, ConfigNum: configNum, OpID: nrand()}
+	for ; ; time.Sleep(cliOpTimeOut) {
+		for _, sname := range snames {
+			var reply GcReply
+			if ok := kv.make_end(sname).Call("ShardKV.Gc", args, &reply); ok && (reply.Err == OK || reply.Err == ErrNotNeedGC || reply.Err == ErrWrongGroup) {
+				return
+			}
+		}
+	}
+
+}
+
+func (kv *ShardKV) Gc(args *GcArgs, reply *GcReply) {
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+	if kv.ShardState[kv.CurrConfig.Num][args.Shard] != Expired {
+		kv.mu.Unlock()
+		reply.Err = ErrNotNeedGC
+		return
+	}
+	ch := make(chan *CommitInfo, 1)
+	kv.WaitCh[args.OpID] = ch
+	kv.mu.Unlock()
+	var cmminfo *CommitInfo
+
+	if _, _, isLeader := kv.rf.Start(*args); !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Lock()
+		kv.WaitCh[args.OpID] = nil
+		kv.mu.Unlock()
+		return
+	}
+
+	select {
+	case cmminfo = <-ch:
+	case <-time.After(cliOpTimeOut):
+		reply.Err = ErrWrongLeader
+		kv.mu.Lock()
+		kv.WaitCh[args.OpID] = nil
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.WaitCh[args.OpID] = nil
+	if cmminfo == nil || cmminfo.OpID != args.OpID {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	reply.Err = OK
 }

@@ -47,7 +47,7 @@ const heartbeatTimeout = time.Duration(80) * time.Millisecond
 
 const electionTimeout = time.Duration(150) * time.Millisecond
 
-const heartbeatInterval = time.Duration(32) * time.Millisecond
+const heartbeatInterval = time.Duration(32)*time.Millisecond + 500*time.Microsecond
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
